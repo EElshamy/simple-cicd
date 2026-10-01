@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Reconciles the running container with the image tag stored in SSM.
+# Invoked by app-deploy.timer (poller) and by the CI/CD pipeline via SSM Run Command.
+# Rendered by Terraform: $$ escape sequences become literal shell variable references.
+set -euo pipefail
+
+APP_NAME="${app_name}"
+APP_DIR="${app_dir}"
+AWS_REGION="${aws_region}"
+SSM_PARAM="${ssm_image_tag_parameter}"
+DEFAULT_TAG="${default_image_tag}"
+ECR_REPOSITORY_URL="${ecr_repository_url}"
+HTTP_PORT="${http_port}"
+CONTAINER_PORT="${container_port}"
+ECR_HOST="$${ECR_REPOSITORY_URL%%/*}"
+
+cd "$${APP_DIR}"
+
+log() { echo "[deploy $${APP_NAME}] $*"; }
+
+IMAGE_TAG="$(aws ssm get-parameter --name "$${SSM_PARAM}" --region "$${AWS_REGION}" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+if [ -z "$${IMAGE_TAG}" ] || [ "$${IMAGE_TAG}" = "None" ]; then
+  IMAGE_TAG="$${DEFAULT_TAG}"
+fi
+
+log "desired tag: $${IMAGE_TAG}"
+aws ecr get-login-password --region "$${AWS_REGION}" \
+  | docker login --username AWS --password-stdin "$${ECR_HOST}" >/dev/null
+
+export ECR_REPOSITORY_URL IMAGE_TAG
+
+docker compose pull
+
+TARGET_IMAGE_ID="$(docker compose images -q app || true)"
+CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$${APP_NAME}" 2>/dev/null || true)"
+
+if [ -n "$${CURRENT_IMAGE_ID}" ] && [ "$${CURRENT_IMAGE_ID}" = "$${TARGET_IMAGE_ID}" ]; then
+  log "image unchanged, nothing to do"
+  exit 0
+fi
+
+log "recreating container"
+docker compose up -d --remove-orphans
+
+log "waiting for health check"
+for _ in $(seq 1 30); do
+  STATUS="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$${APP_NAME}" 2>/dev/null || echo missing)"
+  case "$${STATUS}" in
+  healthy | running)
+    log "healthy: tag=$${IMAGE_TAG} http://127.0.0.1:$${HTTP_PORT}"
+    docker compose ps
+    exit 0
+    ;;
+  unhealthy | exited | missing)
+    break
+    ;;
+  esac
+  sleep 2
+done
+
+log "health check failed (status=$${STATUS:-unknown})"
+docker compose ps || true
+docker compose logs --tail 50 || true
+exit 1

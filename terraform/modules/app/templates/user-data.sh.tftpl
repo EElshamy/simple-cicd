@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Rendered by Terraform, executed once as EC2 user-data (cloud-init).
+# $$ escape sequences become literal shell variable references.
+set -euo pipefail
+
+APP_NAME="${app_name}"
+ENVIRONMENT="${environment}"
+APP_DIR="${app_dir}"
+HTTP_PORT="${http_port}"
+CONTAINER_PORT="${container_port}"
+DEPLOY_INTERVAL="${deploy_interval_seconds}"
+
+log() { echo "[provision $${APP_NAME}] $*"; }
+
+export DEBIAN_FRONTEND=noninteractive
+
+log "installing base packages"
+apt-get update -qq
+apt-get install -y -qq ca-certificates curl gnupg jq unzip
+
+log "installing AWS CLI v2"
+case "$(uname -m)" in
+x86_64) AWS_ARCH=amd64 ;;
+aarch64 | arm64) AWS_ARCH=arm64 ;;
+*)
+  log "unsupported architecture $(uname -m)"
+  exit 1
+  ;;
+esac
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$${AWS_ARCH}.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
+
+log "installing Docker Engine"
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
+  >/etc/apt/sources.list.d/docker.list
+apt-get update -qq
+apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+log "creating $${APP_DIR}"
+mkdir -p "$${APP_DIR}"
+chown -R ubuntu:ubuntu "$${APP_DIR}"
+
+cat >"$${APP_DIR}/docker-compose.yml" <<'COMPOSE_EOF'
+services:
+  app:
+    image: $${ECR_REPOSITORY_URL}:$${IMAGE_TAG}
+    container_name: $APP_NAME
+    restart: unless-stopped
+    ports:
+      - "$HTTP_PORT:$CONTAINER_PORT"
+    environment:
+      NODE_ENV: production
+      PORT: $CONTAINER_PORT
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:$CONTAINER_PORT/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+COMPOSE_EOF
+
+cat >"$${APP_DIR}/deploy.sh" <<'DEPLOY_EOF'
+${deploy_script}
+DEPLOY_EOF
+chmod +x "$${APP_DIR}/deploy.sh"
+
+log "registering systemd timer (every $${DEPLOY_INTERVAL}s)"
+cat >/etc/systemd/system/app-deploy.service <<'SERVICE_EOF'
+[Unit]
+Description=Deploy ${app_name} (${environment})
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${app_dir}
+ExecStart=${app_dir}/deploy.sh
+TimeoutStartSec=300
+SERVICE_EOF
+
+cat >/etc/systemd/system/app-deploy.timer <<'TIMER_EOF'
+[Unit]
+Description=Poll for ${app_name} image updates
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=${deploy_interval_seconds}
+AccuracySec=10
+Unit=app-deploy.service
+
+[Install]
+WantedBy=timers.target
+TIMER_EOF
+
+systemctl daemon-reload
+systemctl enable --now app-deploy.timer
+
+log "done: http://0.0.0.0:$${HTTP_PORT} (docker compose project at $${APP_DIR})"

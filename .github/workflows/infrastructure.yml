@@ -1,0 +1,80 @@
+name: Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "plan (safe) or apply (changes real infrastructure)"
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply]
+      confirm_apply:
+        description: "Type APPLY to confirm a real apply"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  terraform:
+    name: Terraform ${{ github.event.inputs.operation }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Init
+        run: terraform init -input=false
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Apply
+        if: github.event.inputs.operation == 'apply'
+        run: |
+          if [ "${{ github.event.inputs.confirm_apply }}" != "APPLY" ]; then
+            echo "::error::confirm_apply must be set to APPLY"
+            exit 1
+          fi
+          terraform apply -input=false -auto-approve tfplan
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Terraform ${{ github.event.inputs.operation }}"
+            echo ""
+            echo '```terraform'
+            terraform output -no-color 2>/dev/null || echo "(no outputs yet)"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"

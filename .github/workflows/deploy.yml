@@ -1,0 +1,142 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  APP_NAME: ${{ vars.APP_NAME }}
+  AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+
+jobs:
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::12}" >>"$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.repository }}.amazonaws.com/${{ vars.ECR_REPOSITORY_NAME }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.login-ecr.outputs.repository }}.amazonaws.com/${{ vars.ECR_REPOSITORY_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export tag for deploy job
+        run: echo "tag=${{ steps.meta.outputs.tag }}" >>"$GITHUB_OUTPUT"
+
+  deploy:
+    name: Roll out to EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Publish image tag to SSM
+        run: |
+          aws ssm put-parameter \
+            --name "${{ vars.SSM_IMAGE_TAG_PARAMETER }}" \
+            --value "sha-${{ github.sha }}" \
+            --type String \
+            --overwrite \
+            --region "$AWS_REGION"
+
+      - name: Trigger deploy on the server
+        id: run-command
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets "Key=tag:Name,Values=${APP_NAME}-server" \
+            --parameters 'commands=["/opt/'"${APP_NAME}"'/deploy.sh"]' \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' \
+            --output text)
+          echo "command_id=$COMMAND_ID" >>"$GITHUB_OUTPUT"
+          echo "command_id=$COMMAND_ID"
+
+      - name: Wait for deploy to finish
+        run: |
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "${{ steps.run-command.outputs.command_id }}" \
+              --details \
+              --region "$AWS_REGION" \
+              --query 'CommandInvocations[0].Status' \
+              --output text)
+            echo "status: $STATUS"
+            case "$STATUS" in
+            Success) exit 0 ;;
+            Failed | Cancelled | TimedOut)
+              aws ssm get-command-invocation \
+                --command-id "${{ steps.run-command.outputs.command_id }}" \
+                --instance-id "$(aws ssm describe-instance-information \
+                  --filters "Key=Name,Values=${APP_NAME}-server" \
+                  --region "$AWS_REGION" \
+                  --query 'InstanceInformationList[0].InstanceId' \
+                  --output text)" \
+                --region "$AWS_REGION" \
+                --query '{Output:StandardOutputContent,Error:StandardErrorContent}' \
+                --output json
+              exit 1
+              ;;
+            esac
+            sleep 5
+          done
+          echo "timed out waiting for deploy command"
+          exit 1
+
+      - name: Smoke test the application
+        run: |
+          APP_URL="${{ vars.APP_URL }}"
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 10 "$APP_URL" >/dev/null; then
+              echo "application healthy at $APP_URL"
+              exit 0
+            fi
+            echo "attempt $i failed, retrying"
+            sleep 6
+          done
+          echo "application did not become healthy"
+          exit 1

@@ -1,2 +1,15 @@
 node_modules/
 .env
+npm-debug.log
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+*.tfvars
+!*.tfvars.example
+terraform/.ssh_private_key
+*.pem
